@@ -14,8 +14,6 @@ const ROOT = '/tmp/scarlet';
 const upload = multer({ dest: ROOT, limits: { fileSize: 1024 * 1024 * 1024, files: 3 } });
 const builds = new Map();
 
-// Render sits behind a reverse proxy. Trust it so generated install/manifest
-// URLs use the public HTTPS scheme instead of an internal HTTP scheme.
 app.set('trust proxy', 1);
 
 const r2Enabled = Boolean(
@@ -45,15 +43,11 @@ function safeName(name) {
 function publicBase(req) {
   const configured = process.env.PUBLIC_BASE_URL?.trim();
   if (configured) return configured.replace(/\/$/, '').replace(/^http:\/\//i, 'https://');
-
-  const host = req.get('host');
-  return `https://${host}`;
+  return `https://${req.get('host')}`;
 }
 
 function assertHttpsUrl(value, name) {
-  if (!/^https:\/\//i.test(value)) {
-    throw new Error(`${name} must use HTTPS`);
-  }
+  if (!/^https:\/\//i.test(value)) throw new Error(`${name} must use HTTPS`);
 }
 
 async function put(key, data, contentType) {
@@ -66,6 +60,19 @@ async function put(key, data, contentType) {
   }));
 }
 
+// Read the Bundle Identifier directly from the IPA. The signer no longer
+// accepts a user-supplied Bundle ID or rewrites it with zsign -b.
+async function getBundleIdFromIpa(ipaPath) {
+  const script = `import glob, plistlib, sys, zipfile\nwith zipfile.ZipFile(sys.argv[1]) as z:\n    names=[n for n in z.namelist() if n.startswith('Payload/') and n.endswith('.app/Info.plist')]\n    if not names: raise SystemExit('Payload/*.app/Info.plist not found')\n    with z.open(names[0]) as f:\n        p=plistlib.load(f)\n    bid=p.get('CFBundleIdentifier')\n    if not isinstance(bid,str) or not bid: raise SystemExit('CFBundleIdentifier not found')\n    print(bid)`;
+  const { stdout } = await exec('python3', ['-c', script, ipaPath], {
+    timeout: 30 * 1000,
+    maxBuffer: 256 * 1024
+  });
+  const bundleId = stdout.trim();
+  if (!/^[A-Za-z0-9.-]+$/.test(bundleId)) throw new Error('Invalid Bundle ID in IPA.');
+  return bundleId;
+}
+
 app.post('/api/sign', upload.fields([
   { name: 'ipa', maxCount: 1 },
   { name: 'p12', maxCount: 1 },
@@ -76,16 +83,12 @@ app.post('/api/sign', upload.fields([
   const p12 = files.p12?.[0];
   const prov = files.mobileprovision?.[0];
   const password = String(req.body.password || '');
-  const bundleId = String(req.body.bundleId || process.env.DEFAULT_BUNDLE_ID || 'com.example.app')
-    .replace(/[^A-Za-z0-9.-]/g, '');
   const version = String(req.body.version || '1.0').replace(/[^A-Za-z0-9._-]/g, '');
 
   if (!ipa || !p12 || !prov) {
     return res.status(400).json({ error: 'Upload an IPA, .p12 certificate, and .mobileprovision profile.' });
   }
-  if (!password) {
-    return res.status(400).json({ error: 'A .p12 password is required.' });
-  }
+  if (!password) return res.status(400).json({ error: 'A .p12 password is required.' });
 
   const id = crypto.randomBytes(8).toString('hex');
   const out = path.join(ROOT, `${id}-signed.ipa`);
@@ -93,9 +96,11 @@ app.post('/api/sign', upload.fields([
   const filename = `${appName}-signed.ipa`;
 
   try {
-    // Ask zsign to perform its certificate/OCSP check before signing.
-    // This prevents the UI from reporting success when the supplied
-    // certificate is expired/revoked or otherwise unusable.
+    const bundleId = await getBundleIdFromIpa(ipa.path);
+
+    // Validate the supplied certificate/profile pair. This check is still
+    // required by Apple's signing model; only the manual Bundle ID field was
+    // removed. The IPA's existing Bundle ID is preserved during signing.
     try {
       await exec('zsign', ['-C', '-k', p12.path, '-p', password, '-m', prov.path], {
         timeout: 60 * 1000,
@@ -104,17 +109,19 @@ app.post('/api/sign', upload.fields([
     } catch (checkError) {
       const detail = String(checkError.stderr || checkError.stdout || checkError.message).slice(0, 1500);
       return res.status(400).json({
-        error: 'The Apple certificate/provisioning profile did not pass validation. Create/download a valid matching profile and certificate, then try again.',
+        error: 'The Apple certificate/provisioning profile did not pass validation. Upload a valid certificate/profile pair authorized for this app.',
+        bundleId,
         detail
       });
     }
 
+    // Do not pass -b. This preserves the IPA's original Bundle ID instead of
+    // forcing an unrelated value such as com.delta.bz.
     await exec('zsign', [
       '-f',
       '-k', p12.path,
       '-p', password,
       '-m', prov.path,
-      '-b', bundleId,
       '-r', version,
       '-o', out,
       ipa.path
@@ -135,7 +142,6 @@ app.post('/api/sign', upload.fields([
       await put(key, ipaData, 'application/octet-stream');
       download = `${r2Base}/${key}`;
     } else {
-      // Render's local filesystem is temporary; R2 is required for persistence across restarts.
       await fs.copyFile(out, path.join(ROOT, `${id}.ipa`));
       download = `${base}/download/${id}`;
     }
@@ -145,9 +151,7 @@ app.post('/api/sign', upload.fields([
     const manifest = `<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n<plist version="1.0"><dict><key>items</key><array><dict><key>assets</key><array><dict><key>kind</key><string>software-package</string><key>url</key><string>${download}</string></dict></array><key>metadata</key><dict><key>bundle-identifier</key><string>${bundleId}</string><key>bundle-version</key><string>${version}</string><key>kind</key><string>software</string><key>title</key><string>${appName}</string></dict></dict></array></dict></plist>`;
     const manifestKey = `builds/${id}/manifest.plist`;
 
-    if (r2Enabled) {
-      await put(manifestKey, Buffer.from(manifest), 'application/xml');
-    }
+    if (r2Enabled) await put(manifestKey, Buffer.from(manifest), 'application/xml');
 
     builds.set(id, {
       file: path.join(ROOT, `${id}.ipa`),
@@ -162,6 +166,7 @@ app.post('/api/sign', upload.fields([
 
     res.json({
       id,
+      bundleId,
       download,
       manifest: manifestUrl,
       install: `itms-services://?action=download-manifest&url=${encodeURIComponent(manifestUrl)}`,
@@ -169,7 +174,7 @@ app.post('/api/sign', upload.fields([
     });
   } catch (e) {
     res.status(500).json({
-      error: 'Signing failed. Check that the certificate, password, provisioning profile, and Bundle ID match.',
+      error: 'Signing failed. Check that the certificate, password, provisioning profile, and app authorization are valid.',
       detail: String(e.stderr || e.message).slice(0, 1500)
     });
   } finally {
@@ -188,7 +193,6 @@ app.get('/download/:id', async (req, res) => {
 
 app.get('/manifest/:id.plist', async (req, res) => {
   const id = req.params.id;
-
   if (r2Enabled) {
     try {
       const obj = await r2.send(new GetObjectCommand({
@@ -199,15 +203,10 @@ app.get('/manifest/:id.plist', async (req, res) => {
       return;
     } catch {}
   }
-
   const b = builds.get(id);
   if (!b) return res.status(404).send('Manifest not found.');
   res.type('application/xml').send(b.manifest);
 });
 
-app.get('/health', (_req, res) => res.json({
-  ok: true,
-  persistentStorage: r2Enabled
-}));
-
+app.get('/health', (_req, res) => res.json({ ok: true, persistentStorage: r2Enabled }));
 app.listen(PORT, () => console.log(`Scarlet Direct Installing listening on ${PORT}`));
