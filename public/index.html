@@ -16,6 +16,9 @@ button{margin-top:20px;background:#111;color:#fff;border:0;font-weight:700}
 .result{margin-top:20px;padding:16px;background:#f1f1f1;border-radius:12px;display:none}
 .result a{display:block;margin:10px 0;font-weight:700}
 .error{white-space:pre-wrap;color:#a00}
+.history{margin-top:24px}
+.build{padding:14px;margin:12px 0;background:#f1f1f1;border-radius:12px}
+.build a{display:block;margin:8px 0;font-weight:700}
 </style>
 </head>
 <body>
@@ -33,11 +36,25 @@ button{margin-top:20px;background:#111;color:#fff;border:0;font-weight:700}
 </form>
 <p class="hint">Credentials are used only for the signing job and are deleted after processing.</p>
 <div class="result" id="result"></div>
+<div class="history" id="history"><h2>Previous signed builds</h2><p class="hint">Your saved install links are kept on this device. For links to survive server restarts, configure Cloudflare R2 in Render.</p><div id="historyList"></div></div>
 </main>
 <script>
 const f=document.querySelector('#form'),r=document.querySelector('#result'),ipaInput=f.elements.ipa,detected=document.querySelector('#detected');
+const HISTORY_KEY='scarlet-direct-builds-v2';
+function getHistory(){try{return JSON.parse(localStorage.getItem(HISTORY_KEY)||'[]')}catch{return[]}}
+function saveBuild(j){
+ const h=getHistory().filter(x=>x.id!==j.id); h.unshift({id:j.id,bundleId:j.bundleId,install:j.install,download:j.download,manifest:j.manifest,persistent:j.persistent,createdAt:new Date().toISOString()});
+ localStorage.setItem(HISTORY_KEY,JSON.stringify(h.slice(0,25))); renderHistory();
+}
+function renderHistory(){
+ const list=document.querySelector('#historyList'),h=getHistory();
+ if(!h.length){list.innerHTML='<p class="hint">No previous builds on this device.</p>';return}
+ list.innerHTML=h.map(x=>`<div class="build"><b>${escapeHtml(x.bundleId||'Signed IPA')}</b><div class="hint">${new Date(x.createdAt).toLocaleString()}${x.persistent?' • Persistent storage':' • Server storage only'}</div><a href="${x.install}">Install Directly</a><a href="${x.download}">Download Signed IPA</a><a href="${x.manifest}">View Manifest</a></div>`).join('');
+}
+function escapeHtml(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
 ipaInput.addEventListener('change',()=>{detected.style.display=ipaInput.files.length?'block':'none';document.querySelector('#bundleText').textContent='Detected automatically when signing';});
-f.addEventListener('submit',async e=>{e.preventDefault();r.style.display='block';r.className='result';r.textContent='Signing and validating certificate/profile…';try{const x=await fetch('/api/sign',{method:'POST',body:new FormData(f)});const j=await x.json();if(!x.ok){r.className='result error';r.textContent=j.error+(j.bundleId?'\n\nIPA Bundle ID: '+j.bundleId:'')+(j.detail?'\n\n'+j.detail:'');return}r.innerHTML=`<b>Signed successfully.</b><p>Bundle ID: ${j.bundleId}</p><a href="${j.install}">Install Directly</a><a href="${j.download}">Download Signed IPA</a><a href="${j.manifest}">View Manifest</a><small>Build: ${j.id}${j.persistent?' • Persistent storage enabled':' • Add R2 for persistent links'}</small>`}catch(err){r.className='result error';r.textContent=err.message}});
+f.addEventListener('submit',async e=>{e.preventDefault();r.style.display='block';r.className='result';r.textContent='Signing and validating certificate/profile…';try{const x=await fetch('/api/sign',{method:'POST',body:new FormData(f)});const j=await x.json();if(!x.ok){r.className='result error';r.textContent=j.error+(j.bundleId?'\n\nIPA Bundle ID: '+j.bundleId:'')+(j.detail?'\n\n'+j.detail:'');return}saveBuild(j);r.innerHTML=`<b>Signed successfully.</b><p>Bundle ID: ${escapeHtml(j.bundleId)}</p><a href="${j.install}">Install Directly</a><a href="${j.download}">Download Signed IPA</a><a href="${j.manifest}">View Manifest</a><small>Build: ${j.id}${j.persistent?' • Persistent storage enabled':' • Add R2 for persistent links'}</small>`}catch(err){r.className='result error';r.textContent=err.message}});
+renderHistory();
 </script>
 </body>
 </html>
