@@ -1,12 +1,12 @@
-FROM debian:bookworm-slim
+FROM node:22-bookworm-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates git g++ make pkg-config libssl-dev zlib1g-dev libminizip-dev nodejs npm \
+    ca-certificates curl tar \
     && rm -rf /var/lib/apt/lists/* \
-    && git clone --depth 1 https://github.com/zhlynn/zsign.git /opt/zsign \
-    && cd /opt/zsign/build/linux \
-    && make clean && make \
-    && cp zsign /usr/local/bin/zsign
+    && curl -fsSL -o /tmp/zsign.tar.gz https://github.com/zhlynn/zsign/releases/download/v1.1.1/zsign-linux-x86_64.tar.gz \
+    && tar -xzf /tmp/zsign.tar.gz -C /usr/local/bin \
+    && chmod +x /usr/local/bin/zsign \
+    && rm -f /tmp/zsign.tar.gz
 
 WORKDIR /app
 COPY package.json ./
@@ -16,4 +16,4 @@ COPY public ./public
 
 ENV PORT=10000
 EXPOSE 10000
-CMD ["node", "server.js"]
+CMD ["npm", "start"]
