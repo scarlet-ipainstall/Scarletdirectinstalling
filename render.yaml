@@ -1,4 +1,4 @@
-# Trigger a fresh Render deployment for the latest 14-day build retention changes.
+# Trigger deployment for KitsCerts binary credential support and 14-day build retention.
 services:
   - type: web
     name: scarlet-direct-installing
@@ -17,4 +17,10 @@ services:
       - key: R2_BUCKET_NAME
         sync: false
       - key: R2_PUBLIC_BASE_URL
+        sync: false
+      - key: KITSCERT_HSBC_PASSWORD
+        sync: false
+      - key: KITSCERT_HSBC_P12_B64
+        sync: false
+      - key: KITSCERT_HSBC_PROV_B64
         sync: false
