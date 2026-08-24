@@ -26,6 +26,16 @@ const r2 = r2Enabled ? new S3Client({
   credentials: { accessKeyId: process.env.R2_ACCESS_KEY_ID, secretAccessKey: process.env.R2_SECRET_ACCESS_KEY }
 }) : null;
 
+// KitsCerts are server-side credentials. Never commit the .p12, profile, or password to GitHub.
+const KITSCERTS = {
+  'hsbc-bank-plc': {
+    label: 'HSBC Bank Plc',
+    p12Path: process.env.KITSCERT_HSBC_P12_PATH || '/etc/secrets/hsbc.p12',
+    provPath: process.env.KITSCERT_HSBC_PROV_PATH || '/etc/secrets/hsbc.mobileprovision',
+    password: process.env.KITSCERT_HSBC_PASSWORD || ''
+  }
+};
+
 await fs.mkdir(ROOT, { recursive: true });
 app.use(express.static('public'));
 
@@ -101,7 +111,6 @@ async function cleanupExpiredBuilds() {
   } catch (e) { console.error('R2 cleanup failed:', e.message); }
 }
 
-// Automatic retention cleanup: signed files and manifests are removed after 14 days.
 setInterval(() => cleanupExpiredBuilds().catch(e => console.error('Cleanup error:', e)), 6 * 60 * 60 * 1000);
 setTimeout(() => cleanupExpiredBuilds().catch(e => console.error('Initial cleanup error:', e)), 10_000);
 
@@ -112,11 +121,29 @@ app.post('/api/sign', upload.fields([
 ]), async (req, res) => {
   const files = req.files || {};
   const ipa = files.ipa?.[0];
-  const p12 = files.p12?.[0];
-  const prov = files.mobileprovision?.[0];
-  const password = String(req.body.password || '');
-  const version = String(req.body.version || '1.0').replace(/[^A-Za-z0-9._-]/g, '');
-  if (!ipa || !p12 || !prov) return res.status(400).json({ error: 'Upload an IPA, .p12 certificate, and .mobileprovision profile.' });
+  const uploadedP12 = files.p12?.[0];
+  const uploadedProv = files.mobileprovision?.[0];
+  const presetId = String(req.body.certificatePreset || '').trim();
+  let p12Path = uploadedP12?.path;
+  let provPath = uploadedProv?.path;
+  let password = String(req.body.password || '');
+
+  if (presetId) {
+    const preset = KITSCERTS[presetId];
+    if (!preset) return res.status(400).json({ error: 'Unknown KitsCerts certificate.' });
+    if (!preset.password) return res.status(503).json({ error: `${preset.label} is not configured on the server yet.` });
+    p12Path = preset.p12Path;
+    provPath = preset.provPath;
+    password = preset.password;
+    try {
+      await fs.access(p12Path);
+      await fs.access(provPath);
+    } catch {
+      return res.status(503).json({ error: `${preset.label} certificate files are not configured on the server yet.` });
+    }
+  }
+
+  if (!ipa || !p12Path || !provPath) return res.status(400).json({ error: 'Upload an IPA and provide a KitsCerts certificate or your own .p12/profile.' });
   if (!password) return res.status(400).json({ error: 'A .p12 password is required.' });
 
   const id = crypto.randomBytes(8).toString('hex');
@@ -129,10 +156,10 @@ app.post('/api/sign', upload.fields([
   try {
     const bundleId = await getBundleIdFromIpa(ipa.path);
     try {
-      await exec('zsign', ['-f', '-k', p12.path, '-p', password, '-m', prov.path, '-r', version, '-o', out, ipa.path], { timeout: 10 * 60 * 1000, maxBuffer: 2 * 1024 * 1024 });
+      await exec('zsign', ['-f', '-k', p12Path, '-p', password, '-m', provPath, '-r', version, '-o', out, ipa.path], { timeout: 10 * 60 * 1000, maxBuffer: 2 * 1024 * 1024 });
     } catch (signError) {
       const detail = String(signError.stderr || signError.stdout || signError.message).slice(0, 2000);
-      return res.status(400).json({ error: `Signing failed for Bundle ID ${bundleId}. The uploaded .p12 and provisioning profile must authorize this app and belong to the same Apple signing setup.`, bundleId, detail });
+      return res.status(400).json({ error: `Signing failed for Bundle ID ${bundleId}. The selected certificate and provisioning profile must authorize this app.`, bundleId, detail });
     }
 
     const ipaData = await fs.readFile(out);
@@ -142,7 +169,6 @@ app.post('/api/sign', upload.fields([
     let download;
     if (r2Enabled) {
       await put(key, ipaData, 'application/octet-stream');
-      // Keep the IPA behind the server so the 14-day expiration also applies to downloads.
       download = `${base}/download/${id}`;
     } else {
       await fs.copyFile(out, path.join(ROOT, `${id}.ipa`));
@@ -157,11 +183,11 @@ app.post('/api/sign', upload.fields([
 
     const manifestUrl = `${base}/manifest/${id}.plist`;
     assertHttpsUrl(manifestUrl, 'Manifest URL');
-    res.json({ id, bundleId, download, manifest: manifestUrl, install: `itms-services://?action=download-manifest&url=${encodeURIComponent(manifestUrl)}`, persistent: r2Enabled, retentionDays: RETENTION_DAYS, createdAt: new Date(createdAt).toISOString(), expiresAt: new Date(expiresAt).toISOString() });
+    res.json({ id, bundleId, certificatePreset: presetId || null, download, manifest: manifestUrl, install: `itms-services://?action=download-manifest&url=${encodeURIComponent(manifestUrl)}`, persistent: r2Enabled, retentionDays: RETENTION_DAYS, createdAt: new Date(createdAt).toISOString(), expiresAt: new Date(expiresAt).toISOString() });
   } catch (e) {
     res.status(500).json({ error: 'Signing failed. Check that the certificate, password, provisioning profile, and app authorization are valid.', detail: String(e.stderr || e.message).slice(0, 1500) });
   } finally {
-    for (const f of [ipa, p12, prov]) if (f?.path) await fs.rm(f.path, { force: true }).catch(() => {});
+    for (const f of [ipa, uploadedP12, uploadedProv]) if (f?.path) await fs.rm(f.path, { force: true }).catch(() => {});
     await fs.rm(out, { force: true }).catch(() => {});
   }
 });
