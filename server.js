@@ -1,6 +1,6 @@
 import express from 'express';
 import multer from 'multer';
-import { S3Client, PutObjectCommand, GetObjectCommand } from '@aws-sdk/client-s3';
+import { S3Client, PutObjectCommand, GetObjectCommand, DeleteObjectCommand } from '@aws-sdk/client-s3';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import fs from 'node:fs/promises';
@@ -15,6 +15,7 @@ const upload = multer({ dest: ROOT, limits: { fileSize: 1024 * 1024 * 1024, file
 const builds = new Map();
 
 app.set('trust proxy', 1);
+app.use(express.json());
 
 const r2Enabled = Boolean(
   process.env.R2_ACCOUNT_ID &&
@@ -60,9 +61,19 @@ async function put(key, data, contentType) {
   }));
 }
 
-// Read the Bundle Identifier directly from the IPA. Users do not need to
-// enter a Bundle ID manually; the original ID is preserved unless the
-// supplied Apple signing credentials require a different authorized ID.
+async function deleteR2Build(id) {
+  await r2.send(new DeleteObjectCommand({ Bucket: process.env.R2_BUCKET_NAME, Key: `builds/${id}/manifest.plist` }));
+  const b = builds.get(id);
+  if (b?.key) {
+    await r2.send(new DeleteObjectCommand({ Bucket: process.env.R2_BUCKET_NAME, Key: b.key }));
+  }
+  // Also remove the expected IPA object when the build metadata is not in this process.
+  if (!b?.key) {
+    const name = 'signed.ipa';
+    await r2.send(new DeleteObjectCommand({ Bucket: process.env.R2_BUCKET_NAME, Key: `builds/${id}/${name}` }));
+  }
+}
+
 async function getBundleIdFromIpa(ipaPath) {
   const script = `import plistlib, sys, zipfile\nwith zipfile.ZipFile(sys.argv[1]) as z:\n    names=[n for n in z.namelist() if n.startswith('Payload/') and n.endswith('.app/Info.plist')]\n    if not names: raise SystemExit('Payload/*.app/Info.plist not found')\n    with z.open(names[0]) as f:\n        p=plistlib.load(f)\n    bid=p.get('CFBundleIdentifier')\n    if not isinstance(bid,str) or not bid: raise SystemExit('CFBundleIdentifier not found')\n    print(bid)`;
   const { stdout } = await exec('python3', ['-c', script, ipaPath], {
@@ -99,10 +110,6 @@ app.post('/api/sign', upload.fields([
   try {
     const bundleId = await getBundleIdFromIpa(ipa.path);
 
-    // Do not perform a separate pre-validation pass. zsign performs the
-    // authoritative certificate/profile validation as part of the actual
-    // signing operation. This avoids rejecting a usable credential pair
-    // during a redundant check and gives the user the real signing error.
     try {
       await exec('zsign', [
         '-f',
@@ -177,6 +184,27 @@ app.post('/api/sign', upload.fields([
       if (f?.path) await fs.rm(f.path, { force: true }).catch(() => {});
     }
     await fs.rm(out, { force: true }).catch(() => {});
+  }
+});
+
+app.delete('/api/build/:id', async (req, res) => {
+  const id = String(req.params.id || '');
+  if (!/^[a-f0-9]{16}$/.test(id)) return res.status(400).json({ error: 'Invalid build ID.' });
+
+  try {
+    const b = builds.get(id);
+    if (r2Enabled) {
+      if (b?.key) {
+        await r2.send(new DeleteObjectCommand({ Bucket: process.env.R2_BUCKET_NAME, Key: b.key }));
+      }
+      await r2.send(new DeleteObjectCommand({ Bucket: process.env.R2_BUCKET_NAME, Key: `builds/${id}/manifest.plist` }));
+    }
+    if (b?.file) await fs.rm(b.file, { force: true }).catch(() => {});
+    await fs.rm(path.join(ROOT, `${id}.ipa`), { force: true }).catch(() => {});
+    builds.delete(id);
+    res.json({ ok: true, id });
+  } catch (e) {
+    res.status(500).json({ error: 'Could not delete this build.', detail: String(e.message || e).slice(0, 500) });
   }
 });
 
