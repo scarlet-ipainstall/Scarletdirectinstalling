@@ -60,10 +60,11 @@ async function put(key, data, contentType) {
   }));
 }
 
-// Read the Bundle Identifier directly from the IPA. The signer no longer
-// accepts a user-supplied Bundle ID or rewrites it with zsign -b.
+// Read the Bundle Identifier directly from the IPA. Users do not need to
+// enter a Bundle ID manually; the original ID is preserved unless the
+// supplied Apple signing credentials require a different authorized ID.
 async function getBundleIdFromIpa(ipaPath) {
-  const script = `import glob, plistlib, sys, zipfile\nwith zipfile.ZipFile(sys.argv[1]) as z:\n    names=[n for n in z.namelist() if n.startswith('Payload/') and n.endswith('.app/Info.plist')]\n    if not names: raise SystemExit('Payload/*.app/Info.plist not found')\n    with z.open(names[0]) as f:\n        p=plistlib.load(f)\n    bid=p.get('CFBundleIdentifier')\n    if not isinstance(bid,str) or not bid: raise SystemExit('CFBundleIdentifier not found')\n    print(bid)`;
+  const script = `import plistlib, sys, zipfile\nwith zipfile.ZipFile(sys.argv[1]) as z:\n    names=[n for n in z.namelist() if n.startswith('Payload/') and n.endswith('.app/Info.plist')]\n    if not names: raise SystemExit('Payload/*.app/Info.plist not found')\n    with z.open(names[0]) as f:\n        p=plistlib.load(f)\n    bid=p.get('CFBundleIdentifier')\n    if not isinstance(bid,str) or not bid: raise SystemExit('CFBundleIdentifier not found')\n    print(bid)`;
   const { stdout } = await exec('python3', ['-c', script, ipaPath], {
     timeout: 30 * 1000,
     maxBuffer: 256 * 1024
@@ -98,37 +99,31 @@ app.post('/api/sign', upload.fields([
   try {
     const bundleId = await getBundleIdFromIpa(ipa.path);
 
-    // Validate the supplied certificate/profile pair. This check is still
-    // required by Apple's signing model; only the manual Bundle ID field was
-    // removed. The IPA's existing Bundle ID is preserved during signing.
+    // Do not perform a separate pre-validation pass. zsign performs the
+    // authoritative certificate/profile validation as part of the actual
+    // signing operation. This avoids rejecting a usable credential pair
+    // during a redundant check and gives the user the real signing error.
     try {
-      await exec('zsign', ['-C', '-k', p12.path, '-p', password, '-m', prov.path], {
-        timeout: 60 * 1000,
+      await exec('zsign', [
+        '-f',
+        '-k', p12.path,
+        '-p', password,
+        '-m', prov.path,
+        '-r', version,
+        '-o', out,
+        ipa.path
+      ], {
+        timeout: 10 * 60 * 1000,
         maxBuffer: 2 * 1024 * 1024
       });
-    } catch (checkError) {
-      const detail = String(checkError.stderr || checkError.stdout || checkError.message).slice(0, 1500);
+    } catch (signError) {
+      const detail = String(signError.stderr || signError.stdout || signError.message).slice(0, 2000);
       return res.status(400).json({
-        error: 'The Apple certificate/provisioning profile did not pass validation. Upload a valid certificate/profile pair authorized for this app.',
+        error: `Signing failed for Bundle ID ${bundleId}. The uploaded .p12 and provisioning profile must authorize this app and belong to the same Apple signing setup.`,
         bundleId,
         detail
       });
     }
-
-    // Do not pass -b. This preserves the IPA's original Bundle ID instead of
-    // forcing an unrelated value such as com.delta.bz.
-    await exec('zsign', [
-      '-f',
-      '-k', p12.path,
-      '-p', password,
-      '-m', prov.path,
-      '-r', version,
-      '-o', out,
-      ipa.path
-    ], {
-      timeout: 10 * 60 * 1000,
-      maxBuffer: 2 * 1024 * 1024
-    });
 
     const ipaData = await fs.readFile(out);
     const key = `builds/${id}/${filename}`;
