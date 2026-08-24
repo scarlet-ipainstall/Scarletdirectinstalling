@@ -124,6 +124,7 @@ app.post('/api/sign', upload.fields([
   const uploadedP12 = files.p12?.[0];
   const uploadedProv = files.mobileprovision?.[0];
   const presetId = String(req.body.certificatePreset || '').trim();
+  const version = String(req.body.version || '1.0').replace(/[^A-Za-z0-9._-]/g, '');
   let p12Path = uploadedP12?.path;
   let provPath = uploadedProv?.path;
   let password = String(req.body.password || '');
