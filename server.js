@@ -49,13 +49,19 @@ async function getBundleIdFromIpa(ipaPath) {
   return bundleId;
 }
 
+async function listR2BuildObjects(id) {
+  if (!r2Enabled) return [];
+  const listed = await r2.send(new ListObjectsV2Command({ Bucket: process.env.R2_BUCKET_NAME, Prefix: `builds/${id}/` }));
+  return (listed.Contents || []).filter(x => x.Key);
+}
+
 async function deleteBuildObjects(id, knownKey = null) {
   if (!r2Enabled) return;
   const keys = [`builds/${id}/manifest.plist`];
   if (knownKey) keys.push(knownKey);
   try {
-    const listed = await r2.send(new ListObjectsV2Command({ Bucket: process.env.R2_BUCKET_NAME, Prefix: `builds/${id}/` }));
-    for (const obj of listed.Contents || []) if (obj.Key && !keys.includes(obj.Key)) keys.push(obj.Key);
+    const objects = await listR2BuildObjects(id);
+    for (const obj of objects) if (obj.Key && !keys.includes(obj.Key)) keys.push(obj.Key);
   } catch (e) { console.error('R2 list failed during deletion:', e.message); }
   await Promise.all(keys.map(async key => {
     try { await r2.send(new DeleteObjectCommand({ Bucket: process.env.R2_BUCKET_NAME, Key: key })); }
@@ -135,10 +141,9 @@ app.post('/api/sign', upload.fields([
     assertHttpsUrl(base, 'Public base URL');
     let download;
     if (r2Enabled) {
-      const r2Base = process.env.R2_PUBLIC_BASE_URL.replace(/\/$/, '').replace(/^http:\/\//i, 'https://');
-      assertHttpsUrl(r2Base, 'R2 public URL');
       await put(key, ipaData, 'application/octet-stream');
-      download = `${r2Base}/${key}`;
+      // Keep the IPA behind the server so the 14-day expiration also applies to downloads.
+      download = `${base}/download/${id}`;
     } else {
       await fs.copyFile(out, path.join(ROOT, `${id}.ipa`));
       download = `${base}/download/${id}`;
@@ -175,9 +180,26 @@ app.delete('/api/build/:id', async (req, res) => {
 });
 
 app.get('/download/:id', async (req, res) => {
-  const b = builds.get(req.params.id);
-  if (!b || b.persistent || Date.now() >= b.createdAt + RETENTION_MS) return res.status(404).send('This build has expired or is stored in persistent storage.');
-  res.download(b.file, b.name);
+  const id = req.params.id;
+  const b = builds.get(id);
+  if (b && !b.persistent) {
+    if (Date.now() >= b.createdAt + RETENTION_MS) return res.status(404).send('This build has expired.');
+    return res.download(b.file, b.name);
+  }
+  if (!r2Enabled) return res.status(404).send('Build not found.');
+  try {
+    const objects = await listR2BuildObjects(id);
+    const ipaObject = objects.find(x => x.Key.endsWith('.ipa'));
+    if (!ipaObject || !ipaObject.LastModified || Date.now() - ipaObject.LastModified.getTime() >= RETENTION_MS) {
+      await deleteBuildObjects(id, ipaObject?.Key || null);
+      return res.status(404).send('This build has expired.');
+    }
+    const obj = await r2.send(new GetObjectCommand({ Bucket: process.env.R2_BUCKET_NAME, Key: ipaObject.Key }));
+    res.set('Cache-Control', 'no-store');
+    res.set('Content-Type', 'application/octet-stream');
+    res.set('Content-Disposition', `attachment; filename="${safeName(path.basename(ipaObject.Key))}"`);
+    obj.Body.pipe(res);
+  } catch (e) { res.status(404).send('Build not found or expired.'); }
 });
 
 app.get('/manifest/:id.plist', async (req, res) => {
@@ -186,6 +208,10 @@ app.get('/manifest/:id.plist', async (req, res) => {
   if (r2Enabled) {
     try {
       const obj = await r2.send(new GetObjectCommand({ Bucket: process.env.R2_BUCKET_NAME, Key: `builds/${id}/manifest.plist` }));
+      if (!obj.LastModified || Date.now() - obj.LastModified.getTime() >= RETENTION_MS) {
+        await deleteBuildObjects(id, null);
+        return res.status(404).send('Manifest expired.');
+      }
       res.set('Cache-Control', 'no-store');
       res.type('application/xml').send(Buffer.from(await obj.Body.transformToByteArray()));
       return;
